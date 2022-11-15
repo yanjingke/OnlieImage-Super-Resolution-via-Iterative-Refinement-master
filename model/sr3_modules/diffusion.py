@@ -330,60 +330,23 @@ class GaussianDiffusion(nn.Module):
             x_start=x_0, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1),
             noise=noise)
 
-        if tt<self.num_timesteps:
-            with torch.no_grad():
-                continuous_sqrt_alpha_cumprod_plus = torch.FloatTensor(
-                    np.random.uniform(
-                        self.sqrt_alphas_cumprod_prev[tt],
-                        self.sqrt_alphas_cumprod_prev[tt + 1],
-                        size=b
-                    )
-                ).to(x_0.device)
-                continuous_sqrt_alpha_cumprod_plus = continuous_sqrt_alpha_cumprod_plus.view(
-                    b, -1)
-                z_plus = self.q_sample(
-                    x_start=x_0, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod_plus.view(-1, 1, 1, 1),
-                    noise=noise)
-                alpha, sigma = continuous_sqrt_alpha_cumprod_plus.view(-1, 1, 1, 1), (1 - continuous_sqrt_alpha_cumprod_plus ** 2).sqrt().view(-1, 1, 1, 1)
-
-                alpha_s, sigma_s = continuous_sqrt_alpha_cumprod_st.view(-1, 1, 1, 1), (1 - continuous_sqrt_alpha_cumprod_st ** 2).sqrt().view(-1, 1, 1, 1)
-                alpha_1, sigma_1 = continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), (
-                            1 - continuous_sqrt_alpha_cumprod ** 2).sqrt().view(-1, 1, 1, 1)
-
-                v, stem_small, stem_mid = self.denoise_fn(
-                    torch.cat([x_in['SR'], z_plus], dim=1), continuous_sqrt_alpha_cumprod_plus)
-
-                rec = (1 / alpha * (z_plus - sigma * v)).clip(-1, 1)
-                z_1 = alpha_1 * rec + sigma_1 * noise
-
-                v_1, stem_small_1, stem_mid_1 = self.denoise_fn(
-                    torch.cat([x_in['SR'], z_1], dim=1), continuous_sqrt_alpha_cumprod)
-                x_2 = (1 / alpha_1 * (z_1 - sigma_1 * v_1)).clip(-1, 1)
-
-                v_2 = (z - alpha_s * x_2) / sigma_s
-            v, stem_small_2, stem_mid_2 = student_diffusion.denoise_fn(torch.cat([x_in['SR'], z], dim=1),
-                                                                       continuous_sqrt_alpha_cumprod_st)
-            l_pix = self.loss_func(v, v_2).sum() / int(
-                    b * c * h * w)
-        else:
-            with torch.no_grad():
-                v_2, stem_small_1, stem_mid_1 = self.denoise_fn(
+        with torch.no_grad():
+            alpha_s, sigma_s = continuous_sqrt_alpha_cumprod_st.view(-1, 1, 1, 1), (
+                        1 - continuous_sqrt_alpha_cumprod_st ** 2).sqrt().view(-1, 1, 1, 1)
+            alpha_1, sigma_1 = continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), (
+                    1 - continuous_sqrt_alpha_cumprod ** 2).sqrt().view(-1, 1, 1, 1)
+            v_1, stem_small_1, stem_mid_1 = self.denoise_fn(
                 torch.cat([x_in['SR'], z], dim=1), continuous_sqrt_alpha_cumprod)
-                xt_pred = (z - (
-                        1 - continuous_sqrt_alpha_cumprod.view(-1, 1, 1,
-                                                               1) ** 2).sqrt() * v_2) / continuous_sqrt_alpha_cumprod.view(
-                    -1, 1, 1, 1)
-            v, stem_small_2, stem_mid_2 = student_diffusion.denoise_fn(torch.cat([x_in['SR'], z], dim=1),
-                                                                       continuous_sqrt_alpha_cumprod_st)
-            xs_pred = (z - (
-                    1 - continuous_sqrt_alpha_cumprod.view(-1, 1, 1,
-                                                           1) ** 2).sqrt() * v) / continuous_sqrt_alpha_cumprod.view(
-                -1, 1, 1, 1)
+            x_2 = (1 / alpha_1 * (z - sigma_1 * v_1)).clip(-1, 1)
 
-            l_pix = self.loss_func(xt_pred ,xs_pred).sum() / int(
-                b * c * h * w) 
+            v_2 = (z - alpha_s * x_2) / sigma_s
+        v, stem_small_2, stem_mid_2 = student_diffusion.denoise_fn(torch.cat([x_in['SR'], z], dim=1),
+                                                                   continuous_sqrt_alpha_cumprod_st)
+        l_pix = self.loss_func(v, v_2).sum() / int(
+            b * c * h * w)
         l_pix_st = self.loss_func(v, noise).sum() / int(
             b * c * h * w)
+
         return 0.5*l_pix+l_pix_st
     @autocast()
     def forward(self, x,  *args, **kwargs):
