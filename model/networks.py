@@ -8,7 +8,7 @@ logger = logging.getLogger('base')
 ####################
 # initialize
 ####################
-
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 def weights_init_normal(m, std=0.02):
     classname = m.__class__.__name__
@@ -112,5 +112,8 @@ def define_G(opt):
         init_weights(netG, init_type='orthogonal')
     if opt['gpu_ids'] and opt['distributed']:
         assert torch.cuda.is_available()
-        netG = nn.DataParallel(netG)
+        # netG = nn.DataParallel(netG)
+        netG = torch.nn.SyncBatchNorm.convert_sync_batchnorm(netG)
+        netG = DDP(netG.cuda(), device_ids=[opt['local_rank']], output_device=opt['local_rank'],
+                   find_unused_parameters=True, broadcast_buffers=False, )
     return netG

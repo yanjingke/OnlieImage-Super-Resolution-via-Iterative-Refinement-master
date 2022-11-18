@@ -7,7 +7,45 @@ from functools import partial
 import numpy as np
 from tqdm import tqdm
 from torch.cuda.amp import autocast
+class AFD(nn.Module):
+    '''
+    Pay Attention to Features, Transfer Learn Faster CNNs
+    https://openreview.net/pdf?id=ryxyCeHtPB
+    '''
 
+    def __init__(self, in_channels, att_f):
+        super(AFD, self).__init__()
+        mid_channels = int(in_channels * att_f)
+
+        self.attention = nn.Sequential(*[
+            nn.Conv2d(in_channels, mid_channels, 1, 1, 0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, in_channels, 1, 1, 0, bias=True)
+        ])
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    @autocast()
+    def forward(self, fm_s, fm_t, eps=1e-6):
+        fm_t_pooled = F.adaptive_avg_pool2d(fm_t, 1)
+        rho = self.attention(fm_t_pooled)
+        # rho = F.softmax(rho.squeeze(), dim=-1)
+        rho = torch.sigmoid(rho.squeeze())
+        rho = rho / torch.sum(rho, dim=1, keepdim=True)
+
+        fm_s_norm = torch.norm(fm_s, dim=(2, 3), keepdim=True)
+        fm_s = torch.div(fm_s, fm_s_norm + eps)
+        fm_t_norm = torch.norm(fm_t, dim=(2, 3), keepdim=True)
+        fm_t = torch.div(fm_t, fm_t_norm + eps)
+
+        loss = rho * torch.pow(fm_s - fm_t, 2).mean(dim=(2, 3))
+        loss = loss.sum(1).mean(0)
+
+        return loss
 def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
     betas = linear_end * np.ones(n_timestep, dtype=np.float64)
     warmup_time = int(n_timestep * warmup_frac)
@@ -59,6 +97,11 @@ def default(val, d):
     if exists(val):
         return val
     return d() if isfunction(d) else d
+def E_(input, t, shape):
+    out = torch.gather(input, 0, t-1).repeat(shape[0], 1)
+    reshape = [shape[0]] + [1] * (len(shape) - 1)
+    out = out.reshape(*reshape)
+    return out
 
 
 class GaussianDiffusion(nn.Module):
@@ -238,18 +281,12 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(
             x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
-        contrast_text=0
+
         if not self.conditional:
-            x_recon,stem_small, stem_mid= self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod,x_in['text'])
+            x_recon,stem_small, stem_mid= self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
         else:
-            x_recon_text, stem_small_text, stem_mid_text=None,None,None
-            if x_in['text']!=None:
-                x_recon_text,stem_small_text, stem_mid_text = self.denoise_fn(
-                torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod,x_in['text'])
-            x_recon, stem_small, stem_mid = self.denoise_fn(
+            x_recon,stem_small, stem_mid = self.denoise_fn(
                 torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
-
-
         noise_recon = default(x_recon, lambda: torch.randn_like(x_start))
         x0_pred = (x_noisy - (
                 1 - continuous_sqrt_alpha_cumprod.view(-1, 1, 1,
@@ -257,8 +294,60 @@ class GaussianDiffusion(nn.Module):
             -1, 1, 1, 1)
 
         # loss = self.loss_func(noise, x_recon)
-        return noise,x0_pred,t,stem_small, stem_mid,x_recon, x_recon_text,stem_small_text, stem_mid_text
+        return noise,x0_pred,t,stem_small, stem_mid,x_recon
 
+    @torch.no_grad()
+    def get_alpha_sigma(self, x, t):
+        alpha = E_(self.sqrt_alphas_cumprod, t, x.shape)
+        sigma = E_(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+        return alpha, sigma
+    def distill_loss(self, student_diffusion, x_in, tt,ts,  noise=None, gamma=0.3,student_device=None):
+        x_0 = x_in['HR']
+        tt = torch.tensor(tt).to(x_0 .device)
+        ts = torch.tensor(ts).to(x_0 .device)
+
+        [b, c, h, w] = x_0.shape
+        continuous_sqrt_alpha_cumprod_st = torch.FloatTensor(
+            np.random.uniform(
+                student_diffusion.sqrt_alphas_cumprod_prev[ts - 1],
+                student_diffusion.sqrt_alphas_cumprod_prev[ts],
+                size=b
+            )
+        ).to(x_0.device)
+        continuous_sqrt_alpha_cumprod_st = continuous_sqrt_alpha_cumprod_st.view(
+            b, -1)
+        continuous_sqrt_alpha_cumprod = torch.FloatTensor(
+            np.random.uniform(
+                self.sqrt_alphas_cumprod_prev[tt - 1],
+                self.sqrt_alphas_cumprod_prev[tt],
+                size=b
+            )
+        ).to(x_0.device)
+        noise = default(noise, lambda: torch.randn_like(x_0))
+        continuous_sqrt_alpha_cumprod = continuous_sqrt_alpha_cumprod.view(
+            b, -1)
+        z = self.q_sample(
+            x_start=x_0, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1),
+            noise=noise)
+
+        with torch.no_grad():
+            alpha_s, sigma_s = continuous_sqrt_alpha_cumprod_st.view(-1, 1, 1, 1), (
+                        1 - continuous_sqrt_alpha_cumprod_st ** 2).sqrt().view(-1, 1, 1, 1)
+            alpha_1, sigma_1 = continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), (
+                    1 - continuous_sqrt_alpha_cumprod ** 2).sqrt().view(-1, 1, 1, 1)
+            v_1, stem_small_1, stem_mid_1 = self.denoise_fn(
+                torch.cat([x_in['SR'], z], dim=1), continuous_sqrt_alpha_cumprod)
+            x_2 = (1 / alpha_1 * (z - sigma_1 * v_1)).clip(-1, 1)
+
+            v_2 = (z - alpha_s * x_2) / sigma_s
+        v, stem_small_2, stem_mid_2 = student_diffusion.denoise_fn(torch.cat([x_in['SR'], z], dim=1),
+                                                                   continuous_sqrt_alpha_cumprod_st)
+        l_pix = self.loss_func(v, v_2).sum() / int(
+            b * c * h * w)
+        l_pix_st = self.loss_func(v, noise).sum() / int(
+            b * c * h * w)
+
+        return 0.5*l_pix+l_pix_st
     @autocast()
     def forward(self, x,  *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)

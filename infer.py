@@ -18,13 +18,15 @@ if __name__ == "__main__":
     parser.add_argument('-debug', '-d', action='store_true')
     parser.add_argument('-enable_wandb', action='store_true')
     parser.add_argument('-log_infer', action='store_true')
-    
+    parser.add_argument("--local_rank", default=-1, type=int)
     # parse configs
     args = parser.parse_args()
     opt = Logger.parse(args)
     # Convert to NoneDict, which return None for missing key.
     opt = Logger.dict_to_nonedict(opt)
-
+    if opt['local_rank']== None:
+        opt['local_rank']=-1
+    print(opt['local_rank'])
     # logging
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True

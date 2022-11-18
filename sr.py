@@ -9,7 +9,8 @@ from core.wandb_logger import WandbLogger
 from tensorboardX import SummaryWriter
 import os
 import numpy as np
-
+from torch import distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', type=str, default='config/sr_sr3_16_128.json',
@@ -21,13 +22,24 @@ if __name__ == "__main__":
     parser.add_argument('-enable_wandb', action='store_true')
     parser.add_argument('-log_wandb_ckpt', action='store_true')
     parser.add_argument('-log_eval', action='store_true')
+    parser.add_argument("--local_rank",default=-1, type=int)
 
     # parse configs
     args = parser.parse_args()
     opt = Logger.parse(args)
     # Convert to NoneDict, which return None for missing key.
     opt = Logger.dict_to_nonedict(opt)
+    print(args.local_rank)
+    if args.local_rank!=-1:
+        args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    # set_random_seed(args.seed)
+        dist.init_process_group(backend='nccl', init_method='env://')
+        torch.cuda.set_device(args.local_rank)
+        global_rank = dist.get_rank()
 
+        print(f'global_rank = {global_rank} local_rank = {args.local_rank} world_size = {args.world_size}')
+    else:
+        opt['local_rank'] = -1
     # logging
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
@@ -54,12 +66,27 @@ if __name__ == "__main__":
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train' and args.phase != 'val':
             train_set = Data.create_dataset(dataset_opt, phase)
-            train_loader = Data.create_dataloader(
-                train_set, dataset_opt, phase)
+            if opt['gpu_ids'] and opt['distributed']:
+                assert torch.cuda.is_available()
+                # train_sampler.set_epoch(current_epoch)
+                train_sampler = DistributedSampler(train_set)
+
+                train_loader = Data.create_dataloader(
+                    train_set, dataset_opt, phase, train_sampler)
+            else:
+                train_loader = Data.create_dataloader(
+                    train_set, dataset_opt, phase)
         elif phase == 'val':
             val_set = Data.create_dataset(dataset_opt, phase)
-            val_loader = Data.create_dataloader(
-                val_set, dataset_opt, phase)
+            if opt['gpu_ids'] and opt['distributed']:
+                assert torch.cuda.is_available()
+                # train_sampler.set_epoch(current_epoch)
+                valid_sampler = DistributedSampler(val_set)
+                val_loader = Data.create_dataloader(
+                    val_set, dataset_opt, phase, valid_sampler)
+            else:
+                val_loader = Data.create_dataloader(
+                    val_set, dataset_opt, phase)
     logger.info('Initial Dataset Finished')
 
     # model
@@ -184,7 +211,6 @@ if __name__ == "__main__":
             diffusion.feed_data(val_data)
             diffusion.test(continous=True)
             visuals = diffusion.get_current_visuals()
-
             hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
             lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
             fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
@@ -204,27 +230,21 @@ if __name__ == "__main__":
                     sr_img, '{}/{}_{}_sr_process.png'.format(result_path, current_step, idx))
                 Metrics.save_img(
                     Metrics.tensor2img(visuals['SR'][-1]), '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
-
             Metrics.save_img(
                 hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
             Metrics.save_img(
                 lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
             Metrics.save_img(
                 fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
-
             # generation
             eval_psnr = Metrics.calculate_psnr(Metrics.tensor2img(visuals['SR'][-1]), hr_img)
             eval_ssim = Metrics.calculate_ssim(Metrics.tensor2img(visuals['SR'][-1]), hr_img)
-
             avg_psnr += eval_psnr
             avg_ssim += eval_ssim
-
             if wandb_logger and opt['log_eval']:
                 wandb_logger.log_eval_data(fake_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img, eval_psnr, eval_ssim)
-
         avg_psnr = avg_psnr / idx
         avg_ssim = avg_ssim / idx
-
         # log
         logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
         logger.info('# Validation # SSIM: {:.4e}'.format(avg_ssim))

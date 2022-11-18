@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast
 logger = logging.getLogger('base')
 import math
 from torch.cuda.amp import GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
+import numpy as np
 class AFD(nn.Module):
     '''
     Pay Attention to Features, Transfer Learn Faster CNNs
@@ -61,8 +61,6 @@ class DDPM(BaseModel):
         self.set_loss()
         self.set_new_noise_schedule(
             opt['model']['beta_schedule']['train'], schedule_phase='train')
-
-
         if self.opt['phase'] == 'train':
             self.netG.train()
             # find the parameters to optimize
@@ -85,39 +83,38 @@ class DDPM(BaseModel):
             self.loss_func = nn.L1Loss(reduction='sum').to(self.device)
 ####################################################################
        ###设置teach参数
-        if self.opt['distillation'] == 'train':
-            self.opt_tc = opt['model']['beta_schedule']['train'].copy()
-            self.opt_tc['n_timestep'] = 2000
-            self.netG_tc = self.set_device(networks.define_G(opt))
-            self.set_loss_tc()
-            self.set_new_noise_schedule_tc(
-                self.opt_tc, schedule_phase='train')
-            if self.opt['phase'] == 'train':
-                self.netG_tc.eval()
-                # find the parameters to optimize
-                if opt['model']['finetune_norm']:
-                    optim_params = []
-                    for k, v in self.netG_tc.named_parameters():
-                        v.requires_grad = False
-                        if k.find('transformer') >= 0:
-                            v.requires_grad = True
-                            v.data.zero_()
-                            optim_params.append(v)
-                            logger.info(
-                                'Params [{:s}] initialized to 0 and will optimize.'.format(k))
-                else:
-                    optim_params_tc = list(self.netG_tc.parameters())
-                self.optG_tc = torch.optim.Adam(
-                optim_params_tc, lr=opt['train']["optimizer"]["lr"])
-            self.load_network_tc()
+        self.opt_tc=opt['model']['beta_schedule']['train'].copy()
+        self.opt_tc['n_timestep']=2000
+        self.netG_tc = self.set_device(networks.define_G(opt))
+        self.set_loss_tc()
+        self.set_new_noise_schedule_tc(
+            self.opt_tc, schedule_phase='train')
 
+        if self.opt['phase'] == 'train':
+            self.netG_tc.eval()
+            # find the parameters to optimize
+            if opt['model']['finetune_norm']:
+                optim_params = []
+                for k, v in self.netG_tc.named_parameters():
+                    v.requires_grad = False
+                    if k.find('transformer') >= 0:
+                        v.requires_grad = True
+                        v.data.zero_()
+                        optim_params.append(v)
+                        logger.info(
+                            'Params [{:s}] initialized to 0 and will optimize.'.format(k))
+            else:
+                optim_params_tc = list(self.netG_tc.parameters())
+
+            self.optG_tc = torch.optim.Adam(
+                optim_params_tc, lr=opt['train']["optimizer"]["lr"])
             # self.log_dict = OrderedDict()
 ####################################################################################
 
 
         self.load_network()
         self.print_network()
-
+        self.load_network_tc()
 
         self.AFD = AFD(in_channels=512, att_f=1).to(self.device)
         self.scaler = GradScaler()
@@ -127,89 +124,59 @@ class DDPM(BaseModel):
     def optimize_parameters(self,current_step=None):
         b, c, h, w = self.data['HR'].shape
         with autocast():  # 建立autocast的上下文语句
-            # if current_step!=None and current_step%2==0:
-            l_a = 0
-            if self.opt['distillation'] == 'train':
-                with torch.no_grad():
-                    noise_tc, x_recon_tc, t_tc, small_tc, mid_tc ,noise_pre_tc,_,_,_= self.netG_tc(self.data)
+                t_tc = np.random.randint(1, self.netG_tc.num_timesteps +1)
                 time_s = math.ceil(
                     t_tc / (self.opt_tc['n_timestep'] / self.opt['model']['beta_schedule']['train']['n_timestep']))
-                self.optG.zero_grad()
-                noise_st, x_recon_st, t_st, small_st, mid_st,noise_pre_st, x_recon_text,stem_small_text, stem_mid_text = self.netG(self.data, t=time_s)
-                if time_s == 1:
-                    x_recon_tc = self.data['HR']
-                # print(attention_feature)
-                l_pix = self.loss_func(x_recon_tc, x_recon_st).sum() / int(
-                    b * c * h * w) 
-                l_pix_st = self.loss_func(noise_st, noise_pre_st).sum() / int(
-                     b * c * h * w)
-                # l_a=0
-                if self.data['text'] != None:
-                    l_pix_co = self.loss_func(x_recon_text, x_recon_st).sum() / int(
-                        b * c * h * w)
-                    attention_feature = self.AFD(stem_small_text, small_st) + self.AFD(stem_mid_text, mid_st)
-                    l_a=l_pix_co+attention_feature
-                self.scaler.scale(0.5*l_pix+l_pix_st+l_a).backward()
+                # self.scaler.step(self.optG)
+                # # scaler factor更新
+                # self.scaler.update()
+
+                l_pix=self.netG_tc.distill_loss( self.netG, self.data, tt=t_tc,ts=time_s)
+                # self.netG()
+                self.scaler.scale(l_pix).backward()
                 # scaler 更新参数，会先自动unscale梯度
                 # 如果有nan或inf，自动跳过
                 self.scaler.step(self.optG)
-                # scaler factor更新
                 self.scaler.update()
-            else:
-                noise, x_recon, t, small, mid ,noise_pre,x_recon_text,stem_small_text, stem_mid_text= self.netG(self.data)
-                l_pix = self.loss_func(noise, noise_pre).sum() / int(
-                 b * c * h * w)
 
-                # l_a = 0
-                if self.data['text'] != None:
-                    l_pix_co = self.loss_func(x_recon_text, x_recon).sum() / int(
-                        b * c * h * w)
-                    attention_feature = self.AFD(stem_small_text, small) + self.AFD(stem_mid_text, mid)
-                    l_a = l_pix_co+attention_feature
-                self.scaler.scale(l_pix+l_a).backward()
-                self.scaler.step(self.optG)
-                self.scaler.update()
         self.log_dict['l_pix'] = l_pix.item()
 
     def test(self, continous=False):
-        # print(self.opt['local_rank'])
-        if self.opt['local_rank'] == 1 or self.opt['local_rank'] == -1:
-
-            self.netG.eval()
-            with torch.no_grad():
-                if isinstance(self.netG, nn.parallel.DistributedDataParallel):
-                    self.SR = self.netG.module.super_resolution(
-                        self.data['SR'], continous)
-                else:
-                    self.SR = self.netG.super_resolution(
-                        self.data['SR'], continous)
-            self.netG.train()
+        self.netG.eval()
+        with torch.no_grad():
+            if isinstance(self.netG, nn.DataParallel):
+                self.SR = self.netG.module.super_resolution(
+                    self.data['SR'], continous)
+            else:
+                self.SR = self.netG.super_resolution(
+                    self.data['SR'], continous)
+        self.netG.train()
 
     def sample(self, batch_size=1, continous=False):
         self.netG.eval()
         with torch.no_grad():
-            if isinstance(self.netG,  nn.parallel.DistributedDataParallel):
+            if isinstance(self.netG, nn.DataParallel):
                 self.SR = self.netG.module.sample(batch_size, continous)
             else:
                 self.SR = self.netG.sample(batch_size, continous)
         self.netG.train()
 
     def set_loss(self):
-        if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+        if isinstance(self.netG, nn.DataParallel):
             self.netG.module.set_loss(self.device)
         else:
             self.netG.set_loss(self.device)
 
 
     def set_loss_tc(self):
-        if isinstance(self.netG_tc, nn.parallel.DistributedDataParallel):
+        if isinstance(self.netG_tc, nn.DataParallel):
             self.netG_tc.module.set_loss(self.device)
         else:
             self.netG_tc.set_loss(self.device)
     def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
         if self.schedule_phase is None or self.schedule_phase != schedule_phase:
             self.schedule_phase = schedule_phase
-            if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+            if isinstance(self.netG, nn.DataParallel):
                 self.netG.module.set_new_noise_schedule(
                     schedule_opt, self.device)
             else:
@@ -218,7 +185,7 @@ class DDPM(BaseModel):
     def set_new_noise_schedule_tc(self, schedule_opt, schedule_phase='train'):
         if self.schedule_phase_tc is None or self.schedule_phase_tc  != schedule_phase:
             self.schedule_phase_tc  = schedule_phase
-            if isinstance(self.netG_tc, nn.parallel.DistributedDataParallel):
+            if isinstance(self.netG_tc, nn.DataParallel):
                 self.netG_tc.module.set_new_noise_schedule(
                     schedule_opt, self.device)
             else:
@@ -243,7 +210,7 @@ class DDPM(BaseModel):
 
     def print_network(self):
         s, n = self.get_network_description(self.netG)
-        if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+        if isinstance(self.netG, nn.DataParallel):
             net_struc_str = '{} - {}'.format(self.netG.__class__.__name__,
                                              self.netG.module.__class__.__name__)
         else:
@@ -260,21 +227,20 @@ class DDPM(BaseModel):
             self.opt['path']['checkpoint'], 'I{}_E{}_opt.pth'.format(iter_step, epoch))
         # gen
         network = self.netG
-        if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+        if isinstance(self.netG, nn.DataParallel):
             network = network.module
         state_dict = network.state_dict()
         for key, param in state_dict.items():
             state_dict[key] = param.cpu()
-        if self.opt['local_rank'] == 1 or self.opt['local_rank'] == -1:
-            torch.save(state_dict, gen_path)
-            # opt
-            opt_state = {'epoch': epoch, 'iter': iter_step,
-                         'scheduler': None, 'optimizer': None}
-            opt_state['optimizer'] = self.optG.state_dict()
-            torch.save(opt_state, opt_path)
+        torch.save(state_dict, gen_path)
+        # opt
+        opt_state = {'epoch': epoch, 'iter': iter_step,
+                     'scheduler': None, 'optimizer': None}
+        opt_state['optimizer'] = self.optG.state_dict()
+        torch.save(opt_state, opt_path)
 
-            logger.info(
-                'Saved model in [{:s}] ...'.format(gen_path))
+        logger.info(
+            'Saved model in [{:s}] ...'.format(gen_path))
 
     def load_network(self):
         load_path = self.opt['path']['resume_state']
@@ -285,27 +251,27 @@ class DDPM(BaseModel):
             opt_path = '{}_opt.pth'.format(load_path)
             # gen
             network = self.netG
-            if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+            if isinstance(self.netG, nn.DataParallel):
                 network = network.module
             network.load_state_dict(torch.load(
-                gen_path), strict=False)
+                gen_path), strict=(not self.opt['model']['finetune_norm']))
             # network.load_state_dict(torch.load(
             #     gen_path), strict=False)
-            # if self.opt['phase'] == 'train':
-            #     # optimizer
-            #     opt = torch.load(opt_path)
-            #     self.optG.load_state_dict(opt['optimizer'])
-            #     self.begin_step = opt['iter']
-            #     self.begin_epoch = opt['epoch']
+            if self.opt['phase'] == 'train':
+                # optimizer
+                opt = torch.load(opt_path)
+                self.optG.load_state_dict(opt['optimizer'])
+                self.begin_step = opt['iter']
+                self.begin_epoch = opt['epoch']
 
     def load_network_tc(self):
             logger.info(
                 'Loading teacher Network model for G ...')
-            gen_path ="pre/I670000_E42_gen.pth"
+            gen_path ="/home/hyyjs/yanjingke/OnlieImage-Super-Resolution-via-Iterative-Refinement-master/pre/I670000_E42_gen.pth"
             # gen
             network = self.netG_tc
-            if isinstance(self.netG_tc,  nn.parallel.DistributedDataParallel):
+            if isinstance(self.netG_tc, nn.DataParallel):
                 network = network.module
             network.load_state_dict(torch.load(
-                gen_path),  strict=False)
+                gen_path), strict=(not self.opt['model']['finetune_norm']))
             print(self.opt['model']['finetune_norm'])

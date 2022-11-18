@@ -3,8 +3,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from inspect import isfunction
-
-
+from einops import rearrange,reduce,repeat
+from collections import OrderedDict
+from torch.cuda.amp import autocast
 def exists(x):
     return x is not None
 
@@ -157,6 +158,9 @@ class ResnetBlocWithAttn(nn.Module):
             x = self.attn(x)
         return x
 
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
 
 class UNet(nn.Module):
     def __init__(
@@ -231,10 +235,24 @@ class UNet(nn.Module):
         self.ups = nn.ModuleList(ups)
 
         self.final_conv = Block(pre_channel, default(out_channel, in_channel), groups=norm_groups)
+        self.token_embedding = nn.Embedding(49408, 64)
+        self.positional_embedding = nn.Parameter(torch.empty(100, 64))
 
-    def forward(self, x, time):
+        self.mlp=nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(6400, 128)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(128,64))
+        ]))
+    @autocast()
+    def forward(self, x, time,label=None):
         t = self.noise_level_mlp(time) if exists(
             self.noise_level_mlp) else None
+        if label is not None:
+            label=self.token_embedding(label)+ self.positional_embedding
+            label = label.view(x.shape[0],-1)
+            label=self.mlp(label)
+            label=label.view(-1,1,label.shape[-1])
+            t = t + label
 
         feats = []
         for layer in self.downs:

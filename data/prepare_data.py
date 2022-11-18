@@ -71,13 +71,15 @@ def prepare_process_worker(wctx, file_subset):
     for file in file_subset:
         i, imgs = wctx.resize_fn(file)
         lr_img, hr_img, sr_img = imgs
+        # print(i)
+        # print(i.zfill(5))
         if not wctx.lmdb_save:
             lr_img.save(
-                '{}/lr_{}/a_{}.png'.format(wctx.out_path, wctx.sizes[0], i.zfill(5)))
+                '{}/lr_{}/{}.png'.format(wctx.out_path, wctx.sizes[0], i))
             hr_img.save(
-                '{}/hr_{}/a_{}.png'.format(wctx.out_path, wctx.sizes[1], i.zfill(5)))
+                '{}/hr_{}/{}.png'.format(wctx.out_path, wctx.sizes[1], i))
             sr_img.save(
-                '{}/sr_{}_{}/a_{}.png'.format(wctx.out_path, wctx.sizes[0], wctx.sizes[1], i.zfill(5)))
+                '{}/sr_{}_{}/{}.png'.format(wctx.out_path, wctx.sizes[0], wctx.sizes[1], i))
         else:
             with wctx.env.begin(write=True) as txn:
                 txn.put('lr_{}_{}'.format(
@@ -140,11 +142,11 @@ def prepare(img_path, out_path, n_worker, sizes=(16, 128), resample=Image.BICUBI
             lr_img, hr_img, sr_img = imgs
             if not lmdb_save:
                 lr_img.save(
-                    '{}/lr_{}/a_{}.png'.format(out_path, sizes[0], i.zfill(5)))
+                    '{}/lr_{}/{}.png'.format(out_path, sizes[0], i.zfill(5)))
                 hr_img.save(
-                    '{}/hr_{}/a_{}.png'.format(out_path, sizes[1], i.zfill(5)))
+                    '{}/hr_{}/{}.png'.format(out_path, sizes[1], i.zfill(5)))
                 sr_img.save(
-                    '{}/sr_{}_{}/a_{}.png'.format(out_path, sizes[0], sizes[1], i.zfill(5)))
+                    '{}/sr_{}_{}/{}.png'.format(out_path, sizes[0], sizes[1], i.zfill(5)))
             else:
                 with env.begin(write=True) as txn:
                     txn.put('lr_{}_{}'.format(
