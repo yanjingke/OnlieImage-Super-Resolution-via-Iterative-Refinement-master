@@ -29,7 +29,7 @@ if __name__ == "__main__":
     opt = Logger.parse(args)
     # Convert to NoneDict, which return None for missing key.
     opt = Logger.dict_to_nonedict(opt)
-    print(args.local_rank)
+    # print(args.local_rank)
     if args.local_rank!=-1:
         args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     # set_random_seed(args.seed)
@@ -38,6 +38,7 @@ if __name__ == "__main__":
         global_rank = dist.get_rank()
 
         print(f'global_rank = {global_rank} local_rank = {args.local_rank} world_size = {args.world_size}')
+        opt['local_rank'] = args.local_rank
     else:
         opt['local_rank'] = -1
     # logging
@@ -136,56 +137,57 @@ if __name__ == "__main__":
 
                     diffusion.set_new_noise_schedule(
                         opt['model']['beta_schedule']['val'], schedule_phase='val')
-                    for _,  val_data in enumerate(val_loader):
-                        idx += 1
-                        diffusion.feed_data(val_data)
-                        diffusion.test(continous=False)
-                        visuals = diffusion.get_current_visuals()
-                        sr_img = Metrics.tensor2img(visuals['SR'])  # uint8
-                        hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
-                        lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
-                        fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
+                    if args.local_rank == 1 or args.local_rank == -1:
+                        for _, val_data in enumerate(val_loader):
+                            idx += 1
+                            diffusion.feed_data(val_data)
+                            diffusion.test(continous=False)
+                            visuals = diffusion.get_current_visuals()
+                            sr_img = Metrics.tensor2img(visuals['SR'])  # uint8
+                            hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
+                            lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
+                            fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
 
-                        # generation
-                        Metrics.save_img(
-                            hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
-                        Metrics.save_img(
-                            sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
-                        Metrics.save_img(
-                            lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
-                        Metrics.save_img(
-                            fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
-                        tb_logger.add_image(
-                            'Iter_{}'.format(current_step),
-                            np.transpose(np.concatenate(
-                                (fake_img, sr_img, hr_img), axis=1), [2, 0, 1]),
-                            idx)
-                        avg_psnr += Metrics.calculate_psnr(
-                            sr_img, hr_img)
+                            # generation
+                            Metrics.save_img(
+                                hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
+                            Metrics.save_img(
+                                sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
+                            Metrics.save_img(
+                                lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
+                            Metrics.save_img(
+                                fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
+                            tb_logger.add_image(
+                                'Iter_{}'.format(current_step),
+                                np.transpose(np.concatenate(
+                                    (fake_img, sr_img, hr_img), axis=1), [2, 0, 1]),
+                                idx)
+                            avg_psnr += Metrics.calculate_psnr(
+                                sr_img, hr_img)
+
+                            if wandb_logger:
+                                wandb_logger.log_image(
+                                    f'validation_{idx}',
+                                    np.concatenate((fake_img, sr_img, hr_img), axis=1)
+                                )
+
+                        avg_psnr = avg_psnr / idx
+                        diffusion.set_new_noise_schedule(
+                            opt['model']['beta_schedule']['train'], schedule_phase='train')
+                        # log
+                        logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
+                        logger_val = logging.getLogger('val')  # validation logger
+                        logger_val.info('<epoch:{:3d}, iter:{:8,d}> psnr: {:.4e}'.format(
+                            current_epoch, current_step, avg_psnr))
+                        # tensorboard logger
+                        tb_logger.add_scalar('psnr', avg_psnr, current_step)
 
                         if wandb_logger:
-                            wandb_logger.log_image(
-                                f'validation_{idx}',
-                                np.concatenate((fake_img, sr_img, hr_img), axis=1)
-                            )
-
-                    avg_psnr = avg_psnr / idx
-                    diffusion.set_new_noise_schedule(
-                        opt['model']['beta_schedule']['train'], schedule_phase='train')
-                    # log
-                    logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
-                    logger_val = logging.getLogger('val')  # validation logger
-                    logger_val.info('<epoch:{:3d}, iter:{:8,d}> psnr: {:.4e}'.format(
-                        current_epoch, current_step, avg_psnr))
-                    # tensorboard logger
-                    tb_logger.add_scalar('psnr', avg_psnr, current_step)
-
-                    if wandb_logger:
-                        wandb_logger.log_metrics({
-                            'validation/val_psnr': avg_psnr,
-                            'validation/val_step': val_step
-                        })
-                        val_step += 1
+                            wandb_logger.log_metrics({
+                                'validation/val_psnr': avg_psnr,
+                                'validation/val_step': val_step
+                            })
+                            val_step += 1
 
                 if current_step % opt['train']['save_checkpoint_freq'] == 0:
                     logger.info('Saving models and training states.')

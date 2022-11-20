@@ -236,22 +236,29 @@ class UNet(nn.Module):
 
         self.final_conv = Block(pre_channel, default(out_channel, in_channel), groups=norm_groups)
         self.token_embedding = nn.Embedding(49408, 64)
-        self.positional_embedding = nn.Parameter(torch.empty(100, 64))
+        self.positional_embedding = nn.Parameter(torch.empty(128, 64))
 
-        self.mlp=nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(6400, 128)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(128,64))
-        ]))
+        # self.mlp=nn.Sequential(OrderedDict([
+        #     ("c_fc", nn.Linear(6400, 128)),
+        #     ("gelu", QuickGELU()),
+        #     ("c_proj", nn.Linear(128,64))
+        # ]))
     @autocast()
-    def forward(self, x, time,label=None):
+    def forward(self, x, time,label=None,mask_ratio=0.2):
         t = self.noise_level_mlp(time) if exists(
             self.noise_level_mlp) else None
         if label is not None:
+            label=  label.view(x.shape[0],-1)
             label=self.token_embedding(label)+ self.positional_embedding
-            label = label.view(x.shape[0],-1)
-            label=self.mlp(label)
-            label=label.view(-1,1,label.shape[-1])
+            # label=label
+            # _,mask,id=self.random_masking(label, mask_ratio)
+            label=rearrange(label,'b N L ->b L N')
+            # label=label.masked_fill(mask, 1e9)
+            # label = label.view(x.shape[0],-1)
+            # label=self.mlp(label)
+            # label=label.view(-1,1,label.shape[-1])
+            label=F.adaptive_avg_pool1d(label,1)
+            label = rearrange(label, 'b N L ->b L N')
             t = t + label
 
         feats = []

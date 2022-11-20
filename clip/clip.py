@@ -194,7 +194,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     return model, _transform(model.input_resolution.item())
 
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 100, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:
+def tokenize(texts: Union[str, List[str]], context_length: int = 128, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:
     """
     Returns the tokenized representation of given input string(s)
 

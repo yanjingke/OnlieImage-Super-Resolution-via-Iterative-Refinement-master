@@ -135,20 +135,21 @@ class DDPM(BaseModel):
                 time_s = math.ceil(
                     t_tc / (self.opt_tc['n_timestep'] / self.opt['model']['beta_schedule']['train']['n_timestep']))
                 self.optG.zero_grad()
-                noise_st, x_recon_st, t_st, small_st, mid_st,noise_pre_st, x_recon_text,stem_small_text, stem_mid_text = self.netG(self.data, t=time_s)
-                if time_s == 1:
-                    x_recon_tc = self.data['HR']
+                noise_st, x_recon_st, t_st, small_st, mid_st,noise_pre_st, noise_pre_text,stem_small_text, stem_mid_text = self.netG(self.data, t=time_s)
+                # if time_s == 1:
+                #     x_recon_tc = self.data['HR']
                 # print(attention_feature)
                 l_pix = self.loss_func(x_recon_tc, x_recon_st).sum() / int(
                     b * c * h * w) 
                 l_pix_st = self.loss_func(noise_st, noise_pre_st).sum() / int(
                      b * c * h * w)
                 # l_a=0
-                if self.data['text'] != None:
-                    l_pix_co = self.loss_func(x_recon_text, x_recon_st).sum() / int(
+                # if self.data['text'] != None:
+                if "text" in self.data:
+                    l_pix_co = self.loss_func( noise_pre_text, noise_pre_st).sum() / int(
                         b * c * h * w)
                     attention_feature = self.AFD(stem_small_text, small_st) + self.AFD(stem_mid_text, mid_st)
-                    l_a=l_pix_co+attention_feature
+                    l_a=l_pix_co+ attention_feature
                 self.scaler.scale(0.5*l_pix+l_pix_st+l_a).backward()
                 # scaler 更新参数，会先自动unscale梯度
                 # 如果有nan或inf，自动跳过
@@ -156,13 +157,12 @@ class DDPM(BaseModel):
                 # scaler factor更新
                 self.scaler.update()
             else:
-                noise, x_recon, t, small, mid ,noise_pre,x_recon_text,stem_small_text, stem_mid_text= self.netG(self.data)
+                noise, x_recon, t, small, mid ,noise_pre,noise_text_pre,stem_small_text, stem_mid_text= self.netG(self.data)
                 l_pix = self.loss_func(noise, noise_pre).sum() / int(
                  b * c * h * w)
-
                 # l_a = 0
-                if self.data['text'] != None:
-                    l_pix_co = self.loss_func(x_recon_text, x_recon).sum() / int(
+                if "text" in self.data:
+                    l_pix_co =self.loss_func(noise_pre, noise_text_pre).sum() / int(
                         b * c * h * w)
                     attention_feature = self.AFD(stem_small_text, small) + self.AFD(stem_mid_text, mid)
                     l_a = l_pix_co+attention_feature
@@ -172,18 +172,23 @@ class DDPM(BaseModel):
         self.log_dict['l_pix'] = l_pix.item()
 
     def test(self, continous=False):
-        # print(self.opt['local_rank'])
-        if self.opt['local_rank'] == 1 or self.opt['local_rank'] == -1:
-
-            self.netG.eval()
-            with torch.no_grad():
-                if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+        self.netG.eval()
+        with torch.no_grad():
+            if isinstance(self.netG, nn.parallel.DistributedDataParallel):
+                if "text" in self.data:
                     self.SR = self.netG.module.super_resolution(
-                        self.data['SR'], continous)
+                        self.data['SR'],self.data['text'], continous)
+                else:
+                    self.SR = self.netG.module.super_resolution(
+                    self.data['SR'], continous)
+            else:
+                if "text" in self.data:
+                    self.SR = self.netG.super_resolution(
+                        self.data['SR'],self.data['text'],continous)
                 else:
                     self.SR = self.netG.super_resolution(
-                        self.data['SR'], continous)
-            self.netG.train()
+                    self.data['SR'], continous)
+        self.netG.train()
 
     def sample(self, batch_size=1, continous=False):
         self.netG.eval()

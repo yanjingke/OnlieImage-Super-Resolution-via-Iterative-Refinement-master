@@ -148,11 +148,14 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = self.posterior_log_variance_clipped[t]
         return posterior_mean, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, condition_x=None):
+    def p_mean_variance(self, x, t, clip_denoised: bool, text=None,condition_x=None):
         batch_size = x.shape[0]
         noise_level = torch.FloatTensor(
             [self.sqrt_alphas_cumprod_prev[t+1]]).repeat(batch_size, 1).to(x.device)
-        noise,_,_=self.denoise_fn(torch.cat([condition_x, x], dim=1), noise_level)
+        if text!=None:
+            noise, _, _ = self.denoise_fn(torch.cat([condition_x, x], dim=1), noise_level,text)
+        else:
+            noise, _, _ = self.denoise_fn(torch.cat([condition_x, x], dim=1), noise_level)
         if condition_x is not None:
             x_recon= self.predict_start_from_noise(
                 x, t=t, noise=noise)
@@ -169,14 +172,14 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_log_variance
 
     @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised=True, condition_x=None):
+    def p_sample(self, x, t,text=None, clip_denoised=True, condition_x=None):
         model_mean, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, condition_x=condition_x)
+            x=x, t=t, clip_denoised=clip_denoised, text=text,condition_x=condition_x)
         noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
         return model_mean + noise * (0.5 * model_log_variance).exp()
 
     @torch.no_grad()
-    def p_sample_loop(self, x_in, continous=False):
+    def p_sample_loop(self, x_in,text=None, continous=False):
         device = self.betas.device
         sample_inter = (1 | (self.num_timesteps//10))
         if not self.conditional:
@@ -184,7 +187,7 @@ class GaussianDiffusion(nn.Module):
             img = torch.randn(shape, device=device)
             ret_img = img
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img = self.p_sample(img, i)
+                img = self.p_sample(img, i, text=text)
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         else:
@@ -193,7 +196,7 @@ class GaussianDiffusion(nn.Module):
             img = torch.randn(shape, device=device)
             ret_img = x
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img = self.p_sample(img, i, condition_x=x)
+                img = self.p_sample(img, i, text=text,condition_x=x)
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         if continous:
@@ -208,8 +211,8 @@ class GaussianDiffusion(nn.Module):
         return self.p_sample_loop((batch_size, channels, image_size, image_size), continous)
 
     @torch.no_grad()
-    def super_resolution(self, x_in, continous=False):
-        return self.p_sample_loop(x_in, continous)
+    def super_resolution(self, x_in, text=None,continous=False):
+        return self.p_sample_loop(x_in, text,continous)
 
     def q_sample(self, x_start, continuous_sqrt_alpha_cumprod, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -238,25 +241,35 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(
             x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
-        contrast_text=0
         if not self.conditional:
-            x_recon,stem_small, stem_mid= self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod,x_in['text'])
+            if "text" in x_in:
+                x_recon,stem_small, stem_mid= self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod,x_in['text'])
+            else:
+                x_recon, stem_small, stem_mid = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
         else:
-            x_recon_text, stem_small_text, stem_mid_text=None,None,None
-            if x_in['text']!=None:
-                x_recon_text,stem_small_text, stem_mid_text = self.denoise_fn(
-                torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod,x_in['text'])
             x_recon, stem_small, stem_mid = self.denoise_fn(
                 torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
+            # noise_recon = default(x_recon, lambda: torch.randn_like(x_start))
+            if "text" in x_in:
+                x_recon_text, stem_small_text, stem_mid_text = self.denoise_fn(
+                    torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod, x_in['text'])
+
+                noise_recon_text = default(x_recon_text, lambda: torch.randn_like(x_start))
+                x0_pred_text = (x_noisy - (
+                        1 - continuous_sqrt_alpha_cumprod.view(-1, 1, 1,
+                                                               1) ** 2).sqrt() * noise_recon_text) / continuous_sqrt_alpha_cumprod.view(
+                    -1, 1, 1, 1)
 
 
+                return noise,  x0_pred_text, t, stem_small_text, stem_mid_text, x_recon_text, x_recon, stem_small, stem_mid
+        # loss = self.loss_func(noise, x_recon)
         noise_recon = default(x_recon, lambda: torch.randn_like(x_start))
         x0_pred = (x_noisy - (
                 1 - continuous_sqrt_alpha_cumprod.view(-1, 1, 1,
                                                        1) ** 2).sqrt() * noise_recon) / continuous_sqrt_alpha_cumprod.view(
             -1, 1, 1, 1)
 
-        # loss = self.loss_func(noise, x_recon)
+        x_recon_text, stem_small_text, stem_mid_text = None, None, None
         return noise,x0_pred,t,stem_small, stem_mid,x_recon, x_recon_text,stem_small_text, stem_mid_text
 
     @autocast()
